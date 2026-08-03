@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  TWITTER
+  INSTAGRAM
+  YOUTUBE
+}
+
+enum CommentStatus {
+  SYNCED
+  PENDING_PUBLISH
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+/// Tenant boundary for a Blotato customer workspace.
+model Workspace {
+  id        String          @id @default(cuid())
+  name      String
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  accounts  SocialAccount[]
+}
+
+model SocialAccount {
+  id                String    @id @default(cuid())
+  workspaceId       String
+  workspace         Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  platform          Platform
+  externalAccountId String
+  displayName       String
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  posts             Post[]
+
+  @@unique([workspaceId, platform, externalAccountId])
+  @@index([workspaceId])
+}
+
+model Post {
+  id              String          @id @default(cuid())
+  socialAccountId String
+  socialAccount   SocialAccount   @relation(fields: [socialAccountId], references: [id], onDelete: Cascade)
+  /// Denormalized from SocialAccount for query convenience; always kept in sync on create.
+  platform        Platform
+  externalPostId  String
+  caption         String?
+  publishedAt     DateTime
+  /// Last successful comment sync from the platform.
+  lastSyncedAt    DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  comments        Comment[]
+  outbox          PublishOutbox[]
+
+  @@unique([platform, externalPostId])
+  @@index([socialAccountId])
+  @@index([lastSyncedAt])
+}
+
+model Comment {
+  id                String          @id @default(cuid())
+  postId            String
+  post              Post            @relation(fields: [postId], references: [id], onDelete: Cascade)
+  parentCommentId   String?
+  parent            Comment?        @relation("CommentThread", fields: [parentCommentId], references: [id])
+  replies           Comment[]       @relation("CommentThread")
+  /// Root of this thread (self for top-level). Speeds up thread queries.
+  rootCommentId     String?
+  root              Comment?        @relation("CommentRoot", fields: [rootCommentId], references: [id])
+  threadMembers     Comment[]       @relation("CommentRoot")
+  /// 0 = top-level, 1 = reply to top-level, etc.
+  depth             Int             @default(0)
+  /// Null while PENDING_PUBLISH / before platform ack. Partial unique index enforced in SQL.
+  externalCommentId String?
+  authorHandle      String
+  authorExternalId  String?
+  body              String
+  isOurs            Boolean         @default(false)
+  status            CommentStatus   @default(SYNCED)
+  failReason        String?
+  retryCount        Int             @default(0)
+  /// Opaque platform-specific JSON payload.
+  platformRaw       String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  outbox            PublishOutbox[]
+
+  @@index([postId, createdAt, id])
+  @@index([parentCommentId])
+  @@index([rootCommentId])
+  @@index([postId, depth])
+  @@index([status])
+}
+
+/// Outbox for durable platform publish attempts (reply → platform).
+model PublishOutbox {
+  id          String       @id @default(cuid())
+  postId      String
+  post        Post         @relation(fields: [postId], references: [id], onDelete: Cascade)
+  commentId   String
+  comment     Comment      @relation(fields: [commentId], references: [id], onDelete: Cascade)
+  status      OutboxStatus @default(PENDING)
+  attempts    Int          @default(0)
+  lastError   String?
+  availableAt DateTime     @default(now())
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@unique([commentId])
+  @@index([status, availableAt])
+}
+
+/// Scoped, expiring idempotency keys for write endpoints.
+model IdempotencyKey {
+  id        String   @id @default(cuid())
+  /// e.g. "POST:/posts/:id/comments/:id/replies"
+  scope     String
+  key       String
+  response  String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@unique([scope, key])
+  @@index([expiresAt])
+}
